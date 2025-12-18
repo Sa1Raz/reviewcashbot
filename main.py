@@ -7,19 +7,19 @@ from flask_cors import CORS
 import telebot
 
 # ================== CONFIG ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8033069276:AAFv1-kdQ68LjvLEgLHj3ZXd5ehMqyUXOYU")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6482440657"))
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@ReviewCashNews")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://YOUR-VERCEL-URL.vercel.app")
 
 DB_PATH = "data.db"
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 8000))
 
 # ================== INIT ==================
 app = Flask(__name__, static_folder="public", static_url_path="")
 CORS(app)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 logging.basicConfig(level=logging.INFO)
 
 # ================== DB ==================
@@ -29,7 +29,9 @@ def db():
     return conn
 
 def init_db():
-    c = db().cursor()
+    conn = db()
+    c = conn.cursor()
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS users (
         uid TEXT PRIMARY KEY,
@@ -38,6 +40,7 @@ def init_db():
         created_at TEXT
     )
     """)
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,8 +49,9 @@ def init_db():
         status TEXT DEFAULT 'active'
     )
     """)
-    c.connection.commit()
-    c.connection.close()
+
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -56,19 +60,21 @@ def is_subscribed(user_id: int) -> bool:
     try:
         member = bot.get_chat_member(REQUIRED_CHANNEL, user_id)
         return member.status in ("member", "administrator", "creator")
-    except:
+    except Exception as e:
+        logging.warning(f"Subscription check failed: {e}")
         return False
 
 def ensure_user(uid):
-    c = db().cursor()
-    c.execute("SELECT * FROM users WHERE uid=?", (uid,))
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT uid FROM users WHERE uid=?", (uid,))
     if not c.fetchone():
         c.execute(
-            "INSERT INTO users (uid, created_at) VALUES (?,?)",
+            "INSERT INTO users (uid, created_at) VALUES (?, ?)",
             (uid, datetime.utcnow().isoformat())
         )
-        c.connection.commit()
-    c.connection.close()
+        conn.commit()
+    conn.close()
 
 # ================== WEB ==================
 @app.route("/")
@@ -80,26 +86,38 @@ def api_check_sub():
     uid = request.json.get("uid")
     if not uid:
         return jsonify(ok=False)
-
     return jsonify(ok=is_subscribed(int(uid)))
 
 @app.route("/api/profile")
 def api_profile():
     uid = request.args.get("uid")
+    if not uid:
+        return jsonify(ok=False)
+
     ensure_user(uid)
-    c = db().cursor()
+    conn = db()
+    c = conn.cursor()
     c.execute("SELECT * FROM users WHERE uid=?", (uid,))
     user = dict(c.fetchone())
-    c.connection.close()
+    conn.close()
+
     return jsonify(ok=True, user=user)
 
 @app.route("/api/tasks")
 def api_tasks():
-    c = db().cursor()
+    conn = db()
+    c = conn.cursor()
     c.execute("SELECT * FROM tasks WHERE status='active'")
     tasks = [dict(x) for x in c.fetchall()]
-    c.connection.close()
+    conn.close()
     return jsonify(ok=True, tasks=tasks)
+
+# ================== TELEGRAM WEBHOOK ==================
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+    bot.process_new_updates([update])
+    return "OK"
 
 # ================== BOT ==================
 @bot.message_handler(commands=["start"])
@@ -130,10 +148,14 @@ def start(msg):
             web_app=telebot.types.WebAppInfo(url=WEBAPP_URL)
         )
     )
+
     bot.send_message(uid, "✅ Добро пожаловать в ReviewCash", reply_markup=kb)
 
 # ================== RUN ==================
 if __name__ == "__main__":
-    logging.info("Starting bot + backend")
+    logging.info("Starting Flask + Telegram webhook")
+
     bot.remove_webhook()
-    bot.infinity_polling(skip_pending=True)
+    bot.set_webhook(url=f"https://YOUR-PUBLIC-URL/webhook/{BOT_TOKEN}")
+
+    app.run(host="0.0.0.0", port=PORT)
